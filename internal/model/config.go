@@ -203,6 +203,7 @@ type OIDCConfig struct {
 	PrivateKeyPath   string                      `description:"Path to the private key file, including file name." yaml:"privateKeyPath,omitempty"`
 	PublicKeyPath    string                      `description:"Path to the public key file, including file name." yaml:"publicKeyPath,omitempty"`
 	Clients          map[string]OIDCClientConfig `description:"OIDC clients configuration." yaml:"clients,omitempty"`
+	Labels           bool                        `description:"Enable loading OIDC clients from Docker labels, Kubernetes annotations or OIDCClient resources, also starts the OIDC server without static clients." yaml:"labels,omitempty"`
 }
 
 type UIConfig struct {
@@ -292,6 +293,13 @@ type OIDCClientConfig struct {
 	TrustedRedirectURIs []string `description:"List of trusted redirect URIs." yaml:"trustedRedirectUris,omitempty"`
 	Trusted             bool     `description:"Skip the consent screen for this trusted OIDC client." yaml:"trusted,omitempty"`
 	Name                string   `description:"Client name in UI." yaml:"name,omitempty"`
+}
+
+// OIDCClients is the label decode target, it only exposes the OIDC clients
+type OIDCClients struct {
+	OIDC struct {
+		Clients map[string]OIDCClientConfig `description:"OIDC clients configuration." yaml:"clients,omitempty"`
+	} `description:"OIDC configuration." yaml:"oidc,omitempty"`
 }
 
 type ACLsConfig struct {

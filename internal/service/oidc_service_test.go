@@ -10,6 +10,7 @@ import (
 
 	"github.com/tinyauthapp/tinyauth/internal/model"
 	"github.com/tinyauthapp/tinyauth/internal/repository/memory"
+	"github.com/tinyauthapp/tinyauth/internal/utils/decoders"
 	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
 )
 
@@ -201,4 +202,77 @@ func TestCompileUserinfo(t *testing.T) {
 			test.run(t, info)
 		})
 	}
+}
+
+type fakeOIDCLabelProvider struct {
+	clients map[string]model.OIDCClientConfig
+}
+
+func (f *fakeOIDCLabelProvider) Lookup(locator func(name string, app *model.App)) error {
+	return nil
+}
+
+func (f *fakeOIDCLabelProvider) GetOIDCClients() map[string]model.OIDCClientConfig {
+	return f.clients
+}
+
+func TestOIDCLabelClients(t *testing.T) {
+	dir := t.TempDir()
+
+	labels, err := decoders.DecodeLabels[model.OIDCClients](map[string]string{
+		"tinyauth.oidc.clients.myapp.clientId":            "label-client",
+		"tinyauth.oidc.clients.myapp.clientSecret":        "label-secret",
+		"tinyauth.oidc.clients.myapp.trustedRedirectUris": "https://myapp.example.com/callback",
+		"tinyauth.oidc.clients.other.clientId":            "static-client",
+		"tinyauth.oidc.clients.other.name":                "Label Name",
+	}, "oidc")
+	require.NoError(t, err)
+
+	cfg := model.Config{
+		OIDC: model.OIDCConfig{
+			PrivateKeyPath: dir + "/key.pem",
+			PublicKeyPath:  dir + "/key.pub",
+			Labels:         true,
+		},
+	}
+
+	log := logger.NewLogger().WithTestConfig()
+	log.Init()
+
+	newService := func(t *testing.T) *OIDCService {
+		svc, err := NewOIDCService(OIDCServiceInput{
+			Log:           log,
+			Config:        &cfg,
+			Runtime:       &model.RuntimeConfig{AppURL: "https://tinyauth.example.com"},
+			Queries:       memory.New(),
+			Ding:          ding.New(context.TODO()),
+			LabelProvider: &fakeOIDCLabelProvider{clients: labels.OIDC.Clients},
+		})
+		require.NoError(t, err)
+		require.NotNil(t, svc)
+		return svc
+	}
+
+	t.Run("starts without static clients and finds label clients", func(t *testing.T) {
+		client, ok := newService(t).GetClient("label-client")
+		require.True(t, ok)
+		assert.Equal(t, "myapp", client.ID)
+		assert.Equal(t, "Myapp", client.Name)
+		assert.Equal(t, "label-secret", client.ClientSecret)
+		assert.Equal(t, []string{"https://myapp.example.com/callback"}, client.TrustedRedirectURIs)
+
+		_, ok = newService(t).GetClient("unknown")
+		assert.False(t, ok)
+	})
+
+	t.Run("static clients take precedence over label clients", func(t *testing.T) {
+		cfg.OIDC.Clients = map[string]model.OIDCClientConfig{
+			"other": {ClientID: "static-client", Name: "Static Name"},
+		}
+		defer func() { cfg.OIDC.Clients = nil }()
+
+		client, ok := newService(t).GetClient("static-client")
+		require.True(t, ok)
+		assert.Equal(t, "Static Name", client.Name)
+	})
 }

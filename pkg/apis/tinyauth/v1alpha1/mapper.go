@@ -4,6 +4,16 @@ import (
 	"github.com/tinyauthapp/tinyauth/internal/model"
 )
 
+// ToInternalOIDCClient converts the OIDCClientSpec to the internal OIDC client structure,
+// the client secret is resolved separately from its Secret reference
+func (s *OIDCClientSpec) ToInternalOIDCClient() model.OIDCClientConfig {
+	return model.OIDCClientConfig{
+		ClientID:            s.ClientID,
+		TrustedRedirectURIs: s.TrustedRedirectURIs,
+		Name:                s.Name,
+	}
+}
+
 // ToInternalApp converts the ApplicationSpec to the internal App structure
 func (s *ApplicationSpec) ToInternalApp() model.App {
 	return model.App{

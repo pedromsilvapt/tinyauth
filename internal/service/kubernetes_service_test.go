@@ -11,6 +11,7 @@ import (
 	"github.com/tinyauthapp/tinyauth/internal/model"
 	"github.com/tinyauthapp/tinyauth/internal/utils/logger"
 	"github.com/tinyauthapp/tinyauth/pkg/apis/tinyauth/v1alpha1"
+	corev1 "k8s.io/api/core/v1"
 	networking "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -31,6 +32,7 @@ func kubernetesTestLogger() *logger.Logger {
 func newKubernetesServiceForTest() *KubernetesService {
 	return &KubernetesService{
 		apps:        make(map[ResourceMeta]map[string]model.App),
+		oidcClients: make(map[ResourceMeta]map[string]model.OIDCClientConfig),
 		log:         kubernetesTestLogger(),
 		typedClient: clientfake.NewClientset(),
 	}
@@ -277,4 +279,61 @@ func TestKubernetesServiceLookup(t *testing.T) {
 			assert.Equal(t, tt.wantCalls, calls)
 		})
 	}
+}
+
+func TestKubernetesServiceOIDCClients(t *testing.T) {
+	service := newKubernetesServiceForTest()
+	service.config = &model.Config{OIDC: model.OIDCConfig{Labels: true}}
+	res := testResource(ResourceTypeIngress)
+	ingress := testIngress("oidc", map[string]string{
+		"tinyauth.oidc.clients.myapp.clientId":            "label-client",
+		"tinyauth.oidc.clients.myapp.trustedRedirectUris": "https://myapp.example.com/callback",
+	}, "myapp.example.com")
+
+	// An ingress with only OIDC annotations should be tracked
+	service.watchedItemChange(res, &typedItem{typ: ResourceTypeIngress, ingress: ingress}, watch.Added)
+	assert.Equal(t, map[string]model.OIDCClientConfig{
+		"myapp": {ClientID: "label-client", TrustedRedirectURIs: []string{"https://myapp.example.com/callback"}},
+	}, service.GetOIDCClients())
+
+	// Deleting the ingress should remove its clients
+	service.watchedItemChange(res, &typedItem{typ: ResourceTypeIngress, ingress: ingress}, watch.Deleted)
+	assert.Empty(t, service.GetOIDCClients())
+
+	// With OIDC labels disabled, annotations are ignored
+	service.config.OIDC.Labels = false
+	service.watchedItemChange(res, &typedItem{typ: ResourceTypeIngress, ingress: ingress}, watch.Added)
+	assert.Empty(t, service.GetOIDCClients())
+}
+
+func TestKubernetesServiceResyncOIDCClients(t *testing.T) {
+	service := newKubernetesServiceForTest()
+	service.ctx = context.Background()
+	service.typedClient = clientfake.NewClientset(&corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "grafana-oidc", Namespace: "default"},
+		Data:       map[string][]byte{"secret": []byte("s3cret")},
+	})
+	res := testResource(ResourceTypeOIDCClient)
+	obj := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": "tinyauth.app/v1alpha1", "kind": "OIDCClient",
+		"metadata": map[string]any{"name": "grafana", "namespace": "default"},
+		"spec": map[string]any{
+			"clientId":            "grafana-client",
+			"clientSecretRef":     map[string]any{"name": "grafana-oidc", "key": "secret"},
+			"trustedRedirectUris": []any{"https://grafana.example.com/callback"},
+		},
+	}}
+	client := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(), map[schema.GroupVersionResource]string{res.gvr: "OIDCClientList"}, obj)
+	service.client = client
+
+	// Resyncing should pick up the OIDC client with its secret resolved
+	require.NoError(t, service.resyncGVR(res, context.Background()))
+	assert.Equal(t, map[string]model.OIDCClientConfig{
+		"grafana": {ClientID: "grafana-client", ClientSecret: "s3cret", TrustedRedirectURIs: []string{"https://grafana.example.com/callback"}},
+	}, service.GetOIDCClients())
+
+	// Once the resource is gone, resyncing should remove the client
+	require.NoError(t, client.Resource(res.gvr).Namespace("default").Delete(context.Background(), "grafana", metav1.DeleteOptions{}))
+	require.NoError(t, service.resyncGVR(res, context.Background()))
+	assert.Empty(t, service.GetOIDCClients())
 }

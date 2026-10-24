@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sync"
 	"time"
 
@@ -43,15 +44,17 @@ type ResourceMeta struct {
 }
 
 type ExtractionResult struct {
-	Meta *ResourceMeta
-	Apps map[string]model.App
+	Meta        *ResourceMeta
+	Apps        map[string]model.App
+	OIDCClients map[string]model.OIDCClientConfig
 }
 
 type ResourceType string
 
 const (
-	ResourceTypeIngress ResourceType = "ingress"
-	ResourceTypeCRD     ResourceType = "crd"
+	ResourceTypeIngress    ResourceType = "ingress"
+	ResourceTypeCRD        ResourceType = "crd"
+	ResourceTypeOIDCClient ResourceType = "oidcclient"
 )
 
 var supportedResources = []watchedResource{
@@ -71,12 +74,21 @@ var supportedResources = []watchedResource{
 		},
 		typ: ResourceTypeCRD,
 	},
+	{
+		gvr: schema.GroupVersionResource{
+			Group:    "tinyauth.app",
+			Version:  "v1alpha1",
+			Resource: "oidcclients",
+		},
+		typ: ResourceTypeOIDCClient,
+	},
 }
 
 type typedItem struct {
-	typ     ResourceType
-	ingress *networking.Ingress
-	crd     *v1alpha1.Application
+	typ        ResourceType
+	ingress    *networking.Ingress
+	crd        *v1alpha1.Application
+	oidcClient *v1alpha1.OIDCClient
 }
 
 func convertFromUnstructured[T any](obj *unstructured.Unstructured) (*T, error) {
@@ -109,16 +121,27 @@ func (ti *typedItem) fromUnstructured(typ ResourceType, obj *unstructured.Unstru
 			typ: ResourceTypeCRD,
 			crd: typed,
 		}, nil
+	case ResourceTypeOIDCClient:
+		typed, err := convertFromUnstructured[v1alpha1.OIDCClient](obj)
+		if err != nil {
+			return nil, err
+		}
+		return &typedItem{
+			typ:        ResourceTypeOIDCClient,
+			oidcClient: typed,
+		}, nil
 	default:
 		return nil, fmt.Errorf("unknown resource type %s", typ)
 	}
 }
 
 type KubernetesService struct {
-	log *logger.Logger
-	ctx context.Context
+	log    *logger.Logger
+	config *model.Config
+	ctx    context.Context
 
 	apps        map[ResourceMeta]map[string]model.App
+	oidcClients map[ResourceMeta]map[string]model.OIDCClientConfig
 	client      dynamic.Interface
 	typedClient kubernetes.Interface
 	mu          sync.RWMutex
@@ -128,16 +151,19 @@ type KubernetesService struct {
 type KubernetesServiceInput struct {
 	dig.In
 
-	Log  *logger.Logger
-	Ctx  context.Context
-	Ding *ding.Ding
+	Log    *logger.Logger
+	Config *model.Config
+	Ctx    context.Context
+	Ding   *ding.Ding
 }
 
 func NewKubernetesService(i KubernetesServiceInput) (*KubernetesService, error) {
 	service := &KubernetesService{
-		log:  i.Log,
-		apps: make(map[ResourceMeta]map[string]model.App),
-		ctx:  i.Ctx,
+		log:         i.Log,
+		config:      i.Config,
+		apps:        make(map[ResourceMeta]map[string]model.App),
+		oidcClients: make(map[ResourceMeta]map[string]model.OIDCClientConfig),
+		ctx:         i.Ctx,
 	}
 
 	cfg, err := service.getConfig()
@@ -161,6 +187,11 @@ func NewKubernetesService(i KubernetesServiceInput) (*KubernetesService, error) 
 	watchedGVRs := make(map[string]bool)
 
 	for _, res := range supportedResources {
+		// Only watch OIDC clients when OIDC labels are enabled
+		if res.typ == ResourceTypeOIDCClient && !i.Config.OIDC.Labels {
+			continue
+		}
+
 		ctx, cancel := context.WithTimeout(i.Ctx, 10*time.Second)
 		_, err := client.Resource(res.gvr).List(ctx, metav1.ListOptions{Limit: 1})
 		cancel()
@@ -209,12 +240,14 @@ func (k *KubernetesService) addResource(result ExtractionResult) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	k.apps[*result.Meta] = result.Apps
+	k.oidcClients[*result.Meta] = result.OIDCClients
 }
 
 func (k *KubernetesService) removeResource(meta ResourceMeta) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	delete(k.apps, meta)
+	delete(k.oidcClients, meta)
 }
 
 func (k *KubernetesService) runLocator(locator func(name string, app *model.App)) {
@@ -243,7 +276,8 @@ func (k *KubernetesService) watchedItemChange(res watchedResource, typedItem *ty
 			return
 		}
 		extractor := NewKubernetesIngressExtractor(KubernetesIngressExtractorInput{
-			Log: k.log,
+			Log:  k.log,
+			OIDC: k.config != nil && k.config.OIDC.Labels,
 		})
 		result = extractor.Extract(typedItem.ingress)
 	case ResourceTypeCRD:
@@ -257,6 +291,17 @@ func (k *KubernetesService) watchedItemChange(res watchedResource, typedItem *ty
 			Ctx:    k.ctx,
 		})
 		result = extractor.Extract(typedItem.crd)
+	case ResourceTypeOIDCClient:
+		if typedItem.oidcClient == nil {
+			k.log.App.Warn().Str("res", res.pretty()).Msg("OIDC client is nil, skipping")
+			return
+		}
+		extractor := NewKubernetesOIDCClientExtractor(KubernetesOIDCClientInput{
+			Log:    k.log,
+			Client: k.typedClient,
+			Ctx:    k.ctx,
+		})
+		result = extractor.Extract(typedItem.oidcClient)
 	}
 
 	if event == watch.Deleted {
@@ -266,7 +311,7 @@ func (k *KubernetesService) watchedItemChange(res watchedResource, typedItem *ty
 		return
 	}
 
-	if result.Apps == nil {
+	if result.Apps == nil && result.OIDCClients == nil {
 		k.log.App.Warn().Str("res", res.pretty()).Msg("Failed to extract resource, skipping")
 		if result.Meta != nil {
 			k.removeResource(*result.Meta)
@@ -308,6 +353,7 @@ func (k *KubernetesService) resyncGVR(res watchedResource, ctx context.Context) 
 		}
 		if _, ok := seen[key]; !ok {
 			delete(k.apps, key)
+			delete(k.oidcClients, key)
 		}
 	}
 	k.mu.Unlock()
@@ -396,4 +442,17 @@ func (k *KubernetesService) Lookup(locator func(name string, app *model.App)) er
 	k.runLocator(locator)
 
 	return nil
+}
+
+func (k *KubernetesService) GetOIDCClients() map[string]model.OIDCClientConfig {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+
+	clients := make(map[string]model.OIDCClientConfig)
+
+	for _, resourceClients := range k.oidcClients {
+		maps.Copy(clients, resourceClients)
+	}
+
+	return clients
 }

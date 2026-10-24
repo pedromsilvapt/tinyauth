@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"sync"
 	"time"
@@ -27,27 +28,32 @@ var (
 
 type DockerService struct {
 	log    *logger.Logger
+	config *model.Config
 	client *client.Client
 	ctx    context.Context
 
-	apps map[string]model.App
-	mu   sync.RWMutex
+	apps        map[string]model.App
+	oidcClients map[string]model.OIDCClientConfig
+	mu          sync.RWMutex
 }
 
 type DockerServiceInput struct {
 	dig.In
 
-	Log  *logger.Logger
-	Ctx  context.Context
-	Ding *ding.Ding
+	Log    *logger.Logger
+	Config *model.Config
+	Ctx    context.Context
+	Ding   *ding.Ding
 }
 
 func NewDockerService(i DockerServiceInput) (*DockerService, error) {
 	service := &DockerService{
-		log:  i.Log,
-		ctx:  i.Ctx,
-		apps: make(map[string]model.App),
-		mu:   sync.RWMutex{},
+		log:         i.Log,
+		config:      i.Config,
+		ctx:         i.Ctx,
+		apps:        make(map[string]model.App),
+		oidcClients: make(map[string]model.OIDCClientConfig),
+		mu:          sync.RWMutex{},
 	}
 
 	service.log.App.Debug().Msg("Attempting to connect to Docker")
@@ -138,8 +144,20 @@ func (docker *DockerService) sync() error {
 	}
 
 	apps := make(map[string]model.App)
+	oidcClients := make(map[string]model.OIDCClientConfig)
 
 	for _, ctr := range containers {
+		if docker.config.OIDC.Labels {
+			oidcLabels, err := decoders.DecodeLabels[model.OIDCClients](ctr.Labels, "oidc")
+			if err != nil {
+				docker.log.App.Warn().Err(err).Str("container_id", ctr.ID).Msg("Failed to decode container OIDC labels, skipping")
+			} else {
+				for name, config := range oidcLabels.OIDC.Clients {
+					oidcClients[name] = config
+				}
+			}
+		}
+
 		labels, err := decoders.DecodeLabels[model.Apps](ctr.Labels, "apps")
 		if err != nil {
 			docker.log.App.Warn().Err(err).Str("container_id", ctr.ID).Msg("Failed to decode container labels, skipping")
@@ -153,6 +171,7 @@ func (docker *DockerService) sync() error {
 
 	docker.mu.Lock()
 	docker.apps = apps
+	docker.oidcClients = oidcClients
 	docker.mu.Unlock()
 
 	return nil
@@ -167,7 +186,21 @@ func (docker *DockerService) syncWithContainer(containerId string) error {
 	if err != nil {
 		return fmt.Errorf("failed to decode container labels: %w", err)
 	}
+	var oidcLabels model.OIDCClients
+	if docker.config.OIDC.Labels {
+		oidcLabels, err = decoders.DecodeLabels[model.OIDCClients](ctr.Config.Labels, "oidc")
+		if err != nil {
+			return fmt.Errorf("failed to decode container OIDC labels: %w", err)
+		}
+	}
 	docker.mu.Lock()
+	for name, config := range oidcLabels.OIDC.Clients {
+		if !ctr.State.Running {
+			delete(docker.oidcClients, name)
+			continue
+		}
+		docker.oidcClients[name] = config
+	}
 	for app, config := range labels.Apps {
 		if !ctr.State.Running {
 			delete(docker.apps, app)
@@ -283,4 +316,10 @@ func (docker *DockerService) Lookup(locator func(name string, app *model.App)) e
 	}
 	docker.mu.RUnlock()
 	return nil
+}
+
+func (docker *DockerService) GetOIDCClients() map[string]model.OIDCClientConfig {
+	docker.mu.RLock()
+	defer docker.mu.RUnlock()
+	return maps.Clone(docker.oidcClients)
 }

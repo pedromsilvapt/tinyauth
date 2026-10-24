@@ -160,16 +160,22 @@ type UsedCodeEntry struct {
 	Sub string
 }
 
+// OIDCClientProvider is implemented by label providers that can provide OIDC clients
+type OIDCClientProvider interface {
+	GetOIDCClients() map[string]model.OIDCClientConfig
+}
+
 type OIDCService struct {
 	log     *logger.Logger
 	config  *model.Config
 	runtime *model.RuntimeConfig
 	queries repository.Store
 
-	clients    map[string]model.OIDCClientConfig
-	privateKey *rsa.PrivateKey
-	publicKey  *rsa.PublicKey
-	issuer     string
+	clients      map[string]model.OIDCClientConfig
+	labelClients OIDCClientProvider
+	privateKey   *rsa.PrivateKey
+	publicKey    *rsa.PublicKey
+	issuer       string
 
 	caches struct {
 		code      *cache.CacheStore[AuthorizeCodeEntry]
@@ -190,11 +196,13 @@ type OIDCServiceInput struct {
 	Runtime *model.RuntimeConfig
 	Queries repository.Store
 	Ding    *ding.Ding
+
+	LabelProvider LabelProvider `optional:"true"`
 }
 
 func NewOIDCService(i OIDCServiceInput) (*OIDCService, error) {
 	// If not configured, skip init
-	if len(i.Config.OIDC.Clients) == 0 {
+	if len(i.Config.OIDC.Clients) == 0 && !i.Config.OIDC.Labels {
 		return nil, nil
 	}
 
@@ -322,22 +330,20 @@ func NewOIDCService(i OIDCServiceInput) (*OIDCService, error) {
 	clients := make(map[string]model.OIDCClientConfig)
 
 	for id, client := range i.Config.OIDC.Clients {
-		client.ID = id
-		if client.Name == "" {
-			client.Name = utils.Capitalize(client.ID)
-		}
+		client = normalizeOIDCClient(id, client)
 		clients[client.ClientID] = client
+		i.Log.App.Debug().Str("clientId", client.ClientID).Msg("Loaded OIDC client configuration")
 	}
 
-	// Load the client secrets from files if they exist
-	for id, client := range clients {
-		secret := utils.GetSecret(client.ClientSecret, client.ClientSecretFile)
-		if secret != "" {
-			client.ClientSecret = secret
+	// Use the label provider for OIDC clients if enabled and supported
+	var labelClients OIDCClientProvider
+
+	if i.Config.OIDC.Labels {
+		if provider, ok := i.LabelProvider.(OIDCClientProvider); ok {
+			labelClients = provider
+		} else {
+			i.Log.App.Warn().Msg("OIDC labels enabled but no label provider is available")
 		}
-		client.ClientSecretFile = ""
-		clients[id] = client
-		i.Log.App.Debug().Str("clientId", client.ClientID).Msg("Loaded OIDC client configuration")
 	}
 
 	// Initialize the service
@@ -347,10 +353,11 @@ func NewOIDCService(i OIDCServiceInput) (*OIDCService, error) {
 		runtime: i.Runtime,
 		queries: i.Queries,
 
-		clients:    clients,
-		privateKey: privateKey,
-		publicKey:  rPublicKey,
-		issuer:     issuer,
+		clients:      clients,
+		labelClients: labelClients,
+		privateKey:   privateKey,
+		publicKey:    rPublicKey,
+		issuer:       issuer,
 	}
 
 	// Remove consents for clients that are no longer configured
@@ -395,8 +402,35 @@ func (service *OIDCService) GetIssuer() string {
 }
 
 func (service *OIDCService) GetClient(id string) (model.OIDCClientConfig, bool) {
-	client, ok := service.clients[id]
-	return client, ok
+	if client, ok := service.clients[id]; ok {
+		return client, true
+	}
+
+	if service.labelClients == nil {
+		return model.OIDCClientConfig{}, false
+	}
+
+	for name, client := range service.labelClients.GetOIDCClients() {
+		if client.ClientID == id {
+			return normalizeOIDCClient(name, client), true
+		}
+	}
+
+	return model.OIDCClientConfig{}, false
+}
+
+func normalizeOIDCClient(id string, client model.OIDCClientConfig) model.OIDCClientConfig {
+	client.ID = id
+	if client.Name == "" {
+		client.Name = utils.Capitalize(client.ID)
+	}
+	// Load the client secret from file if it exists
+	secret := utils.GetSecret(client.ClientSecret, client.ClientSecretFile)
+	if secret != "" {
+		client.ClientSecret = secret
+	}
+	client.ClientSecretFile = ""
+	return client
 }
 
 func (service *OIDCService) ValidateAuthorizeParams(req AuthorizeRequest) error {
@@ -1078,7 +1112,7 @@ func (service *OIDCService) reconcileOIDCConsents(ctx context.Context) error {
 
 		cleaned[consent.ClientID] = struct{}{}
 
-		if _, ok := service.clients[consent.ClientID]; ok {
+		if _, ok := service.GetClient(consent.ClientID); ok {
 			continue
 		}
 

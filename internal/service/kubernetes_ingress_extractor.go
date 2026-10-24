@@ -35,16 +35,19 @@ func hostCoversName(host string, name string) bool {
 }
 
 type KubernetesIngressExtractor struct {
-	log *logger.Logger
+	log  *logger.Logger
+	oidc bool
 }
 
 type KubernetesIngressExtractorInput struct {
-	Log *logger.Logger
+	Log  *logger.Logger
+	OIDC bool
 }
 
 func NewKubernetesIngressExtractor(i KubernetesIngressExtractorInput) *KubernetesIngressExtractor {
 	return &KubernetesIngressExtractor{
-		log: i.Log,
+		log:  i.Log,
+		oidc: i.OIDC,
 	}
 }
 
@@ -139,8 +142,20 @@ func (k *KubernetesIngressExtractor) Extract(ingress *networking.Ingress) Extrac
 		apps = nil
 	}
 
+	var oidcClients map[string]model.OIDCClientConfig
+
+	if k.oidc {
+		oidcLabels, err := decoders.DecodeLabels[model.OIDCClients](annotations, "oidc")
+		if err != nil {
+			k.log.App.Warn().Err(err).Str("namespace", meta.Namespace).Str("name", meta.Name).Msg("Failed to decode resource OIDC labels, skipping")
+		} else if len(oidcLabels.OIDC.Clients) > 0 {
+			oidcClients = oidcLabels.OIDC.Clients
+		}
+	}
+
 	return ExtractionResult{
-		Meta: meta,
-		Apps: apps,
+		Meta:        meta,
+		Apps:        apps,
+		OIDCClients: oidcClients,
 	}
 }
